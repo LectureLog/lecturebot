@@ -1,0 +1,14 @@
+[Unit]
+Description=Import selected Telegram lecture topics into LectureLog
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=%h/.config/lecture-sync/config.toml
+
+[Service]
+Type=oneshot
+# If installed elsewhere, change this absolute executable path.
+ExecStart=%h/Projects/LectureBot/.venv/bin/lecturebot sync
+UMask=0077
+NoNewPrivileges=true
+LimitCORE=0
+TimeoutStartSec=infinity

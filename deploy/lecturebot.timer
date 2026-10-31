@@ -1,0 +1,11 @@
+[Unit]
+Description=Check for new lecture recordings every 30 minutes
+
+[Timer]
+OnCalendar=*-*-* *:00,30:00
+Persistent=true
+RandomizedDelaySec=60
+Unit=lecturebot.service
+
+[Install]
+WantedBy=timers.target

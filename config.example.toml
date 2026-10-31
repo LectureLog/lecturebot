@@ -1,0 +1,13 @@
+# Non-secret settings. Credentials are stored in the OS keyring.
+base_url = "https://lecturelog.sarvizza.com"
+chat_name = "Боталка 3 курс"
+chat_id = 0 # Resolved by: lecturebot configure
+topic_names = ["Сист прога", "Формалки"]
+topic_ids = [] # Resolved by: lecturebot configure
+since = "2026-10-31"
+timezone = "Europe/Moscow"
+extract_slides = true
+max_file_bytes = 5368709120
+# Add ONLY the exact storage host returned by LectureLog, e.g. files.example.org.
+# Never put a presigned URL (with its secret query string) here.
+upload_hosts = []

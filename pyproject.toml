@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lecturebot"
+version = "0.2.0"
+description = "Local Telegram topic to LectureLog importer"
+requires-python = ">=3.12"
+dependencies = ["Telethon>=1.40,<2", "requests>=2.32,<3", "keyring>=25,<26", "SecretStorage>=3.3; sys_platform == 'linux'"]
+
+[project.optional-dependencies]
+browser = ["playwright>=1.48,<2"]
+
+[project.scripts]
+lecturebot = "lecture_sync.cli:main"
+lecture-sync = "lecture_sync.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["lecture_sync*"]
