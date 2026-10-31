@@ -13,7 +13,7 @@ from pathlib import Path
 
 from . import secrets, telegram
 from .core import DEFAULT, Store, SyncError, config_path, cutoff, load_config, private_dir, run_lock, save_config, state_dir
-from .lecturelog import AmbiguousConfirm, LectureLog
+from .lecturelog import AmbiguousConfirm, AuthExpired, LectureLog
 
 
 def output(value):
@@ -88,6 +88,54 @@ def reconcile(store, client, config, cards=None, directory=None):
     return count
 
 
+async def publish_submitted(config, store, web=None):
+    if not config["publish_ready"]:
+        return 0
+    rows = [r for r in store.rows("submitted", config["chat_id"])
+            if r["publication_state"] != "published" and r["lecture_id"]
+            and r["topic_id"] in config["topic_ids"]
+            and dt.datetime.fromisoformat(r["published_at"]) >= cutoff(config)]
+    if not rows:
+        return 0
+    own_client = web is None
+    web = web or remote(config)
+    published, errors = 0, 0
+    try:
+        if own_client:
+            await asyncio.to_thread(web.prepare)
+        for row in rows:
+            status = None
+            try:
+                detail = await asyncio.to_thread(web.inspect, row["lecture_id"])
+                status = detail["status"]
+                if status != "ready":
+                    store.publication(row, status)
+                    if status == "failed":
+                        print(f"Сообщение {row['message_id']}: обработка завершилась ошибкой; публикация не выполняется.")
+                    continue
+                if detail.get("visibility") == "public":
+                    url = web.base + "/read/" + web.lecture_id(row["lecture_id"])
+                elif detail.get("visibility") == "private":
+                    url = await asyncio.to_thread(web.publish, row["lecture_id"])
+                else:
+                    raise SyncError("Не распознана видимость готовой лекции; публикация отменена.")
+                store.publication(row, status, published=True, public_url=url)
+                published += 1
+                print(f"Опубликовано сообщение {row['message_id']}: {url}")
+            except SyncError as exc:
+                store.publication(row, status, error=str(exc))
+                if isinstance(exc, AuthExpired):
+                    raise
+                errors += 1
+                print(f"Сообщение {row['message_id']}: {exc}")
+    finally:
+        if own_client:
+            web.close()
+    if errors:
+        raise SyncError(f"Не удалось проверить или опубликовать лекций: {errors}. Повтор — при следующем запуске.")
+    return published
+
+
 async def import_pending(config, store, directory):
     if not config["chat_id"] or not config["topic_ids"]:
         raise SyncError("Сначала выполните configure.")
@@ -130,6 +178,7 @@ async def import_pending(config, store, directory):
                 store.mark(row, "submitted", matches[0])
                 path.unlink(missing_ok=True)
                 print(f"Импортировано сообщение {row['message_id']}; lecture_id={matches[0]}")
+        await publish_submitted(config, store, web)
     finally:
         web.close()
 
@@ -139,8 +188,20 @@ async def async_command(args, config, store, directory):
         await telegram.login()
         print("Telegram-сессия сохранена в системной связке ключей.")
         return
+    if args.command == "publish-ready":
+        await publish_submitted(config, store)
+        return
     if args.command in ("import", "sync"):
         if args.command == "sync":
+            # Previously uploaded lectures can be published even when Telegram
+            # is temporarily unavailable or has no new messages.
+            try:
+                await publish_submitted(config, store)
+            except AuthExpired:
+                raise
+            except SyncError as exc:
+                # A deleted/unrecognised old lecture must not block new imports.
+                print(f"Проверка публикаций: {exc}")
             async with telegram.connected() as tg:
                 await telegram.scan(tg, config, store)
         await import_pending(config, store, directory)
@@ -180,7 +241,7 @@ def parser():
     p = argparse.ArgumentParser(prog="lecturebot", description="LectureBot: импорт выбранных тем Telegram в LectureLog")
     p.add_argument("--config", type=Path, default=config_path())
     sub = p.add_subparsers(dest="command", required=True)
-    for command in ("init", "login-telegram", "dialogs", "topics", "preview", "import", "sync", "reconcile", "check"):
+    for command in ("init", "login-telegram", "dialogs", "topics", "preview", "import", "sync", "reconcile", "check", "publish-ready"):
         sub.add_parser(command)
     c = sub.add_parser("configure")
     c.add_argument("--chat-id", type=int)
@@ -216,7 +277,7 @@ def main():
             try:
                 if args.command == "preview":
                     for row in store.rows(chat_id=config["chat_id"] or None):
-                        output({k: row[k] for k in ("message_id", "subject", "title", "size", "status", "lecture_id", "error")})
+                        output({k: row[k] for k in ("message_id", "subject", "title", "size", "status", "lecture_id", "error", "processing_state", "publication_state", "publication_error", "public_url")})
                 elif args.command in ("check", "reconcile"):
                     web = remote(config)
                     try:

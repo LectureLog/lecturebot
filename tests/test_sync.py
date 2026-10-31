@@ -29,6 +29,28 @@ class FakeServer(BaseAdapter):
         self.lose_confirm_response = False
         self.login_redirect = False
         self.upload_host = "files.test"
+        self.statuses = {}
+        self.visibilities = {}
+        self.publication_requests = []
+        self.lose_publish_response = False
+        self.bad_publish_response = False
+
+    @staticmethod
+    def identity(index=0):
+        return f"00000000-0000-0000-0000-{index:012d}"
+
+    def card(self, index, title, progress_only=False):
+        from html import escape
+        identity = self.identity(index)
+        status = self.statuses.get(identity, "processing")
+        visibility = self.visibilities.get(identity, "private")
+        progress = f'<div id="lec-progress-{identity}"><div class="ll-status ll-status--{status}"></div></div>'
+        if progress_only and status == "processing":
+            return progress
+        button = (f'<button class="ll-toggle ll-toggle--{visibility}" hx-post="/lectures/{identity}/visibility"></button>'
+                  if status == "ready" or visibility == "public" else "")
+        return (f'<article id="lec-{identity}"><input name="title" value="{escape(title, quote=True)}">'
+                + progress + button + '</article>')
 
     def close(self):
         pass
@@ -46,10 +68,29 @@ class FakeServer(BaseAdapter):
         elif request.url.endswith("/upload"):
             r._content = b'<section id="ll-upload" data-csrf="csrf-test"></section>'
         elif request.url.endswith("/lectures"):
-            from html import escape
             r._content = ('<section class="ll-lectures-section">' + ''.join(
-                f'<article id="lec-{i}"><input name="title" value="{escape(title, quote=True)}"></article>'
+                self.card(i, title)
                 for i, title in enumerate(self.created)) + '</section>').encode()
+        elif request.url.endswith("/status"):
+            identity = request.url.split("/")[-2]
+            index = next((i for i in range(len(self.created)) if self.identity(i) == identity), None)
+            if index is None:
+                r.status_code = 404
+            else:
+                r._content = self.card(index, self.created[index], progress_only=True).encode()
+        elif request.url.endswith("/visibility"):
+            from urllib.parse import parse_qs
+            identity = request.url.split("/")[-2]
+            self.publication_requests.append(request)
+            assert parse_qs(request.body) == {"visibility": ["public"]}
+            if self.statuses.get(identity) != "ready":
+                r.status_code = 409
+            else:
+                index = next(i for i in range(len(self.created)) if self.identity(i) == identity)
+                self.visibilities[identity] = "public"
+                if self.lose_publish_response:
+                    raise requests.Timeout("secret-that-must-not-be-logged")
+                r._content = ("unknown" if self.bad_publish_response else self.card(index, self.created[index])).encode()
         elif request.url.endswith("/presign"):
             r._content = json.dumps(dict(put_url=f"https://{self.upload_host}/object?signature=SECRET", token="upload-secret", s3_key="object")).encode()
         elif request.method == "PUT":

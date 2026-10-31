@@ -7,6 +7,8 @@ topic_ids = [] # Resolved by: lecturebot configure
 since = "2026-10-31"
 timezone = "Europe/Moscow"
 extract_slides = true
+# Publish only successfully processed lectures imported by this tool.
+publish_ready = true
 max_file_bytes = 5368709120
 # Add ONLY the exact storage host returned by LectureLog, e.g. files.example.org.
 # Never put a presigned URL (with its secret query string) here.

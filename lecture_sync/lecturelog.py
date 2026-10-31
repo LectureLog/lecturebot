@@ -3,6 +3,7 @@ from __future__ import annotations
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urlsplit
+from uuid import UUID
 
 import requests
 
@@ -23,6 +24,8 @@ class Page(HTMLParser):
         self.csrf = None
         self.cards = {}
         self.article = None
+        self.progress = None
+        self.details = {}
         self.feed(html)
 
     def handle_starttag(self, tag, attrs):
@@ -31,12 +34,30 @@ class Page(HTMLParser):
             self.csrf = a.get("data-csrf")
         if tag == "article" and a.get("id", "").startswith("lec-"):
             self.article = a["id"][4:]
+            self.details.setdefault(self.article, {})
+        if tag == "div" and a.get("id", "").startswith("lec-progress-"):
+            self.progress = a["id"][13:]
+            self.details.setdefault(self.progress, {})
+        identity = self.article or self.progress
+        if identity:
+            details = self.details[identity]
+            classes = a.get("class", "").split()
+            for status in ("processing", "ready", "failed"):
+                if "ll-status--" + status in classes:
+                    previous = details.get("status")
+                    details["status"] = status if previous in (None, status) else "unknown"
+            if tag == "button" and a.get("hx-post") == f"/lectures/{identity}/visibility":
+                for visibility in ("public", "private"):
+                    if "ll-toggle--" + visibility in classes:
+                        previous = details.get("visibility")
+                        details["visibility"] = visibility if previous in (None, visibility) else "unknown"
         if tag == "input" and a.get("name") == "title" and self.article:
             self.cards.setdefault(a.get("value", ""), []).append(self.article)
 
     def handle_endtag(self, tag):
         if tag == "article":
             self.article = None
+            self.progress = None
 
 
 class LectureLog:
@@ -100,6 +121,33 @@ class LectureLog:
             host = target.hostname or "неизвестен"
             raise SyncError(f"Хост хранилища не разрешён: {host}. Проверьте его и добавьте в upload_hosts конфигурации.")
         return data
+
+    @staticmethod
+    def lecture_id(value):
+        try:
+            return str(UUID(value))
+        except (ValueError, TypeError, AttributeError):
+            raise SyncError("Неизвестный формат идентификатора лекции.") from None
+
+    def inspect(self, lecture_id):
+        lecture_id = self.lecture_id(lecture_id)
+        # This route refreshes the processing status from the core, unlike
+        # /lectures, which may still contain a stale database snapshot.
+        r = self.request("GET", f"/lectures/{lecture_id}/status", headers={"HX-Request": "true"})
+        detail = Page(r.text).details.get(lecture_id, {})
+        if detail.get("status") not in ("processing", "ready", "failed"):
+            raise SyncError("Не распознан статус лекции; публикация отменена.")
+        return detail
+
+    def publish(self, lecture_id):
+        lecture_id = self.lecture_id(lecture_id)
+        # Explicitly SET public, never toggle: retrying a lost response is safe.
+        r = self.request("POST", f"/lectures/{lecture_id}/visibility", headers=self.headers(),
+                         data={"visibility": "public"})
+        detail = Page(r.text).details.get(lecture_id, {})
+        if detail.get("status") != "ready" or detail.get("visibility") != "public":
+            raise SyncError("Сайт не подтвердил публичный доступ к готовой лекции.")
+        return self.base + "/read/" + lecture_id
 
     def put(self, path: Path, row, upload):
         # A separate session prevents forwarding LectureLog cookies/CSRF to storage.

@@ -39,7 +39,7 @@ DEFAULT = dict(
     base_url="https://lecturelog.sarvizza.com", chat_name="Боталка 3 курс", chat_id=0,
     topic_names=["Сист прога", "Формалки"], topic_ids=[], since="2026-10-31",
     timezone="Europe/Moscow", extract_slides=True, max_file_bytes=5 << 30,
-    upload_hosts=[],
+    upload_hosts=[], publish_ready=True,
 )
 
 
@@ -63,6 +63,8 @@ def load_config(path: Path) -> dict:
     cutoff(config)  # Validate date and timezone before accessing either account.
     if not isinstance(config["max_file_bytes"], int) or config["max_file_bytes"] <= 0:
         raise SyncError("max_file_bytes должен быть положительным целым числом.")
+    if not isinstance(config["publish_ready"], bool):
+        raise SyncError("publish_ready должен быть true или false.")
     return config
 
 
@@ -120,6 +122,16 @@ class Store:
                 PRIMARY KEY(chat_id, topic_id)
             );
         """)
+        # Upgrade existing import journals without resetting deduplication.
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(recordings)")}
+        for name, definition in {
+            "processing_state": "TEXT",
+            "publication_state": "TEXT NOT NULL DEFAULT 'pending'",
+            "publication_error": "TEXT",
+            "public_url": "TEXT",
+        }.items():
+            if name not in columns:
+                self.db.execute(f"ALTER TABLE recordings ADD COLUMN {name} {definition}")
         # A crash after sending confirm cannot safely be retried automatically.
         self.db.execute("UPDATE recordings SET status='uncertain' WHERE status='confirming'")
         self.db.commit()
@@ -148,6 +160,13 @@ class Store:
     def cursor(self, chat_id, topic_id):
         row = self.db.execute("SELECT last_id FROM cursors WHERE chat_id=? AND topic_id=?", (chat_id, topic_id)).fetchone()
         return row[0] if row else 0
+
+    def publication(self, row, processing_state, *, published=False, public_url=None, error=None):
+        self.db.execute("""UPDATE recordings SET processing_state=?, publication_state=?,
+                        public_url=?, publication_error=? WHERE chat_id=? AND message_id=?""",
+                        (processing_state, "published" if published else "pending", public_url,
+                         error, row["chat_id"], row["message_id"]))
+        self.db.commit()
 
     def advance(self, chat_id, topic_id, message_id):
         self.db.execute("INSERT INTO cursors VALUES (?,?,?) ON CONFLICT(chat_id,topic_id) DO UPDATE SET last_id=MAX(last_id,excluded.last_id)", (chat_id, topic_id, message_id))

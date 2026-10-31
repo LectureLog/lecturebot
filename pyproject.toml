@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lecturebot"
-version = "0.2.0"
+version = "0.3.0"
 description = "Local Telegram topic to LectureLog importer"
 requires-python = ">=3.12"
 dependencies = ["Telethon>=1.40,<2", "requests>=2.32,<3", "keyring>=25,<26", "SecretStorage>=3.3; sys_platform == 'linux'"]
