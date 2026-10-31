@@ -88,13 +88,15 @@ def reconcile(store, client, config, cards=None, directory=None):
     return count
 
 
-async def publish_submitted(config, store, web=None):
-    if not config["publish_ready"]:
+async def publish_submitted(config, store, web=None, *, message_id=None):
+    if message_id is None and not config["publish_ready"]:
         return 0
     rows = [r for r in store.rows("submitted", config["chat_id"])
-            if r["publication_state"] != "published" and r["lecture_id"]
+            if r["lecture_id"]
             and r["topic_id"] in config["topic_ids"]
-            and dt.datetime.fromisoformat(r["published_at"]) >= cutoff(config)]
+            and ((message_id is not None and r["message_id"] == message_id)
+                 or (message_id is None and r["publication_state"] != "published"
+                     and dt.datetime.fromisoformat(r["published_at"]) >= cutoff(config)))]
     if not rows:
         return 0
     own_client = web is None
@@ -136,7 +138,7 @@ async def publish_submitted(config, store, web=None):
     return published
 
 
-async def import_pending(config, store, directory):
+async def import_pending(config, store, directory, *, message_id=None):
     if not config["chat_id"] or not config["topic_ids"]:
         raise SyncError("Сначала выполните configure.")
     web = remote(config)
@@ -144,14 +146,18 @@ async def import_pending(config, store, directory):
         await asyncio.to_thread(web.prepare)
         cards = await asyncio.to_thread(web.listings)
         reconcile(store, web, config, cards, directory)
+        pending = [r for r in store.rows("pending", config["chat_id"])
+                   if r["topic_id"] in config["topic_ids"] and r["size"] <= config["max_file_bytes"]
+                   and ((message_id is not None and r["message_id"] == message_id)
+                        or (message_id is None and dt.datetime.fromisoformat(r["published_at"]) >= cutoff(config)))]
+        if not pending:
+            if message_id is None:
+                await publish_submitted(config, store, web)
+            return
         async with telegram.connected() as tg:
             dialog = await telegram.resolve_chat(tg, config)
             downloads = private_dir(directory / "downloads")
-            for row in store.rows("pending", chat_id=dialog.id):
-                if row["topic_id"] not in config["topic_ids"] or dt.datetime.fromisoformat(row["published_at"]) < cutoff(config):
-                    continue
-                if row["size"] > config["max_file_bytes"]:
-                    continue
+            for row in pending:
                 # Recheck before every item, including after interrupted previous runs.
                 cards = await asyncio.to_thread(web.listings)
                 matches = cards.get(row["title"], [])
@@ -178,7 +184,37 @@ async def import_pending(config, store, directory):
                 store.mark(row, "submitted", matches[0])
                 path.unlink(missing_ok=True)
                 print(f"Импортировано сообщение {row['message_id']}; lecture_id={matches[0]}")
-        await publish_submitted(config, store, web)
+        if message_id is None:
+            await publish_submitted(config, store, web)
+    finally:
+        web.close()
+
+
+async def import_one(args, config, store, directory):
+    if args.timeout <= 0 or args.poll_interval <= 0:
+        raise SyncError("timeout и poll-interval должны быть положительными.")
+    message_id = await telegram.queue_one(args.message, config, store)
+    print(f"Выбрано сообщение {message_id}; остальные записи не импортируются.")
+    await import_pending(config, store, directory, message_id=message_id)
+    row = next(r for r in store.rows(chat_id=config["chat_id"]) if r["message_id"] == message_id)
+    if row["status"] != "submitted" or not row["lecture_id"]:
+        raise SyncError("Загрузка не подтверждена однозначно. Выполните reconcile; повторная отправка заблокирована.")
+    print(f"Лекция {row['lecture_id']}: ожидаем готовность конспекта.")
+    web = remote(config)
+    try:
+        await asyncio.to_thread(web.prepare)
+        deadline = time.monotonic() + args.timeout
+        while True:
+            if await publish_submitted(config, store, web, message_id=message_id):
+                return
+            row = next(r for r in store.rows(chat_id=config["chat_id"]) if r["message_id"] == message_id)
+            if row["processing_state"] == "failed":
+                raise SyncError("Обработка выбранной лекции завершилась ошибкой. Повтор обработки на сайте автоматически не запускается.")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise SyncError("Время ожидания истекло. Лекция уже загружена; повторите import-one с той же ссылкой для продолжения проверки.")
+            print(f"Сообщение {message_id}: обработка продолжается.")
+            await asyncio.sleep(min(args.poll_interval, remaining))
     finally:
         web.close()
 
@@ -187,6 +223,9 @@ async def async_command(args, config, store, directory):
     if args.command == "login-telegram":
         await telegram.login()
         print("Telegram-сессия сохранена в системной связке ключей.")
+        return
+    if args.command == "import-one":
+        await import_one(args, config, store, directory)
         return
     if args.command == "publish-ready":
         await publish_submitted(config, store)
@@ -247,6 +286,10 @@ def parser():
     c.add_argument("--chat-id", type=int)
     s = sub.add_parser("scan")
     s.add_argument("--history", action="store_true", help="Заново просмотреть историю с даты since")
+    one = sub.add_parser("import-one", help="Загрузить одну запись Telegram, дождаться обработки и опубликовать")
+    one.add_argument("message", help="ID сообщения или приватная ссылка t.me/c/…")
+    one.add_argument("--timeout", type=int, default=7200, help="Ожидание обработки в секундах (по умолчанию 7200)")
+    one.add_argument("--poll-interval", type=int, default=30, help="Интервал проверки в секундах (по умолчанию 30)")
     w = sub.add_parser("login-web")
     w.add_argument("--manual", action="store_true")
     w.add_argument("--browser-channel", default="chrome", help="chrome; пустая строка — Chromium Playwright")

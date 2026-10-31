@@ -6,11 +6,85 @@ import mimetypes
 import shutil
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 from . import secrets
 from .core import SyncError, cutoff, lecture_title, topic_of
 
 EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"}
+
+
+def message_selection(value: str, config):
+    """Return a message ID and optional topic hint; never fetch a supplied URL."""
+    if not config["chat_id"] or not config["topic_ids"]:
+        raise SyncError("Сначала выполните configure.")
+    value = value.strip()
+    if value.isascii() and value.isdigit() and int(value) > 0:
+        return int(value), None
+    u = urlsplit(value)
+    parts = u.path.strip("/").split("/")
+    if (u.scheme != "https" or u.netloc not in ("t.me", "telegram.me")
+            or len(parts) not in (3, 4) or parts[0] != "c"
+            or not all(p.isascii() and p.isdigit() and int(p) > 0 for p in parts[1:])):
+        raise SyncError("Укажите ID сообщения или ссылку https://t.me/c/CHAT_ID/[TOPIC_ID/]MESSAGE_ID.")
+    if int("-100" + parts[1]) != config["chat_id"]:
+        raise SyncError("Ссылка относится к другой группе; импорт отменён.")
+    query = parse_qs(u.query, keep_blank_values=True)
+    if "comment" in query:
+        raise SyncError("Нужна прямая ссылка на сообщение с файлом, а не на комментарий.")
+    hint = int(parts[2]) if len(parts) == 4 else None
+    if "thread" in query:
+        values = query["thread"]
+        if len(values) != 1 or not values[0].isascii() or not values[0].isdigit() or int(values[0]) <= 0:
+            raise SyncError("Некорректный ID топика в ссылке.")
+        if hint is not None and hint != int(values[0]):
+            raise SyncError("В ссылке указаны разные топики.")
+        hint = int(values[0])
+    if hint is not None and hint not in config["topic_ids"]:
+        raise SyncError("Топик из ссылки не входит в выбранные предметы.")
+    return int(parts[-1]), hint
+
+
+def recording_data(message, chat_id, config):
+    if not message or not getattr(message, "file", None):
+        raise SyncError("В сообщении нет доступного аудио- или видеофайла.")
+    subjects = dict(zip(config["topic_ids"], config["topic_names"], strict=True))
+    topic = topic_of(message)
+    if topic not in subjects:
+        raise SyncError("Сообщение находится вне выбранных топиков.")
+    file = message.file
+    mime = file.mime_type or ""
+    filename = file.name or f"recording-{message.id}{mimetypes.guess_extension(mime) or ''}"
+    filename = Path(filename.replace("\\", "/")).name
+    ext = Path(filename).suffix.lower()
+    if ext not in EXTENSIONS:
+        raise SyncError("Формат вложения не поддерживается для записи лекции.")
+    if not file.size or file.size > config["max_file_bytes"]:
+        raise SyncError("Размер записи превышает лимит или файл пуст.")
+    if not mime.startswith(("video/", "audio/")):
+        mime = mimetypes.guess_type(filename)[0] or ("video/mp4" if ext in {".mp4", ".mkv", ".mov", ".avi", ".webm"} else "audio/mpeg")
+    return dict(chat_id=chat_id, message_id=message.id, topic_id=topic, subject=subjects[topic],
+                filename=filename, size=file.size, mime=mime, published_at=message.date.isoformat(),
+                title=lecture_title(subjects[topic], message.date.astimezone(cutoff(config).tzinfo), filename, chat_id, message.id))
+
+
+async def queue_one(value, config, store):
+    message_id, hint = message_selection(value, config)
+    existing = next((r for r in store.rows(chat_id=config["chat_id"]) if r["message_id"] == message_id), None)
+    if existing:
+        if existing["topic_id"] not in config["topic_ids"] or hint not in (None, existing["topic_id"]):
+            raise SyncError("Запись не соответствует выбранному топику.")
+        return message_id
+    async with connected() as client:
+        dialog = await resolve_chat(client, config)
+        message = await client.get_messages(dialog.entity, ids=message_id)
+        row = recording_data(message, dialog.id, config)
+        if hint not in (None, row["topic_id"]):
+            raise SyncError("Топик сообщения не совпадает с топиком ссылки.")
+        # Manual selection is explicit and may precede the automatic cutoff.
+        # Do not advance cursors: this must not skip any other messages.
+        store.add(**row)
+    return message_id
 
 
 async def login():
@@ -100,24 +174,10 @@ async def scan(client, config, store, history=False):
         topic = topic_of(message)
         if topic not in subjects or message.id <= cursors[topic]:
             continue
-        file = message.file
-        if not file:
+        try:
+            store.add(**recording_data(message, dialog.id, config))
+        except SyncError:
             continue
-        mime = file.mime_type or ""
-        filename = file.name or f"recording-{message.id}{mimetypes.guess_extension(mime) or ''}"
-        filename = Path(filename.replace("\\", "/")).name
-        ext = Path(filename).suffix.lower()
-        if ext not in EXTENSIONS:
-            continue
-        if not file.size or file.size > config["max_file_bytes"]:
-            print(f"Пропущено сообщение {message.id}: неподходящий размер файла.")
-            continue
-        # Telegram documents sometimes report application/octet-stream.
-        if not mime.startswith(("video/", "audio/")):
-            mime = mimetypes.guess_type(filename)[0] or ("video/mp4" if ext in {".mp4", ".mkv", ".mov", ".avi", ".webm"} else "audio/mpeg")
-        store.add(chat_id=dialog.id, message_id=message.id, topic_id=topic, subject=subjects[topic],
-                  filename=filename, size=file.size, mime=mime, published_at=message.date.isoformat(),
-                  title=lecture_title(subjects[topic], message.date.astimezone(since.tzinfo), filename, dialog.id, message.id))
     # Only commit high-water marks after an entire successful scan.
     for topic in subjects:
         store.advance(dialog.id, topic, high)
