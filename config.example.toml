@@ -1,9 +1,9 @@
 # Non-secret settings. Credentials are stored in the OS keyring.
 base_url = "https://lecturelog.sarvizza.com"
 chat_name = "Боталка 3 курс"
-chat_id = 0 # Resolved by: lecturebot configure
+chat_id = 0 # Set with configure --chat-id -100… --topic-ids …
 topic_names = ["Сист прога", "Формалки"]
-topic_ids = [] # Resolved by: lecturebot configure
+topic_ids = [] # Numeric IDs, in the same order as topic_names
 since = "2026-10-31"
 timezone = "Europe/Moscow"
 extract_slides = true
@@ -13,3 +13,11 @@ max_file_bytes = 5368709120
 # Add ONLY the exact storage host returned by LectureLog, e.g. files.example.org.
 # Never put a presigned URL (with its secret query string) here.
 upload_hosts = []
+
+# Cloud API: no api_id/api_hash, but downloads limited to 20 MB.
+telegram_api_url = "https://api.telegram.org"
+# For large lectures use a local telegram-bot-api --local server instead:
+# telegram_api_url = "http://127.0.0.1:8081"
+# telegram_local_files = "/absolute/path/to/bot-api-data"
+# Running that server requires its own api_id/api_hash.
+telegram_local_files = ""

@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace as NS
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from lecture_sync import cli, telegram
 from lecture_sync.core import DEFAULT, Store, SyncError
@@ -59,7 +59,7 @@ class ImportOneTests(unittest.IsolatedAsyncioTestCase):
                 return file
 
         @contextlib.asynccontextmanager
-        async def connected():
+        async def connected(*args):
             yield TG()
 
         async def resolve(*args):
@@ -67,6 +67,7 @@ class ImportOneTests(unittest.IsolatedAsyncioTestCase):
 
         self.patches = [
             patch.object(telegram, "connected", connected),
+            patch.object(telegram, "scan", AsyncMock()),
             patch.object(telegram, "resolve_chat", resolve),
             patch.object(cli, "remote", side_effect=lambda cfg: remote(self.server, cfg)),
         ]

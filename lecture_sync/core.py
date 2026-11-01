@@ -40,6 +40,7 @@ DEFAULT = dict(
     topic_names=["Сист прога", "Формалки"], topic_ids=[], since="2026-10-31",
     timezone="Europe/Moscow", extract_slides=True, max_file_bytes=5 << 30,
     upload_hosts=[], publish_ready=True,
+    telegram_api_url="https://api.telegram.org", telegram_local_files="",
 )
 
 
@@ -65,6 +66,19 @@ def load_config(path: Path) -> dict:
         raise SyncError("max_file_bytes должен быть положительным целым числом.")
     if not isinstance(config["publish_ready"], bool):
         raise SyncError("publish_ready должен быть true или false.")
+    endpoint = urlsplit(config["telegram_api_url"])
+    if (endpoint.username or endpoint.password or endpoint.query or endpoint.fragment
+            or endpoint.path not in ("", "/") or not (
+                config["telegram_api_url"].rstrip("/") == "https://api.telegram.org"
+                or (endpoint.scheme == "http" and endpoint.hostname in ("127.0.0.1", "localhost", "::1")))):
+        raise SyncError("telegram_api_url: допустим облачный API или локальный HTTP-сервер на loopback.")
+    config["telegram_api_url"] = config["telegram_api_url"].rstrip("/")
+    if (not isinstance(config["chat_id"], int) or isinstance(config["chat_id"], bool)
+            or not isinstance(config["topic_ids"], list)
+            or any(type(t) is not int or t <= 0 for t in config["topic_ids"])
+            or len(set(config["topic_ids"])) != len(config["topic_ids"])
+            or (config["topic_ids"] and len(config["topic_ids"]) != len(config["topic_names"]))):
+        raise SyncError("Задайте chat_id и уникальные положительные topic_ids в порядке topic_names.")
     return config
 
 
@@ -120,6 +134,21 @@ class Store:
             CREATE TABLE IF NOT EXISTS cursors (
                 chat_id INTEGER NOT NULL, topic_id INTEGER NOT NULL, last_id INTEGER NOT NULL,
                 PRIMARY KEY(chat_id, topic_id)
+            );
+            CREATE TABLE IF NOT EXISTS bot_offsets (
+                bot_id INTEGER PRIMARY KEY, next_id INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS bot_chats (
+                bot_id INTEGER NOT NULL, chat_id INTEGER NOT NULL, name TEXT NOT NULL,
+                PRIMARY KEY(bot_id, chat_id)
+            );
+            CREATE TABLE IF NOT EXISTS bot_topics (
+                bot_id INTEGER NOT NULL, chat_id INTEGER NOT NULL, topic_id INTEGER NOT NULL,
+                name TEXT NOT NULL, PRIMARY KEY(bot_id, chat_id, topic_id)
+            );
+            CREATE TABLE IF NOT EXISTS bot_files (
+                bot_id INTEGER NOT NULL, chat_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
+                metadata TEXT NOT NULL, PRIMARY KEY(bot_id, chat_id, message_id)
             );
         """)
         # Upgrade existing import journals without resetting deduplication.

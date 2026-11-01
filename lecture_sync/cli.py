@@ -154,9 +154,11 @@ async def import_pending(config, store, directory, *, message_id=None):
             if message_id is None:
                 await publish_submitted(config, store, web)
             return
-        async with telegram.connected() as tg:
+        async with telegram.connected(config) as tg:
+            tg.store = store
             dialog = await telegram.resolve_chat(tg, config)
             downloads = private_dir(directory / "downloads")
+            blocked = 0
             for row in pending:
                 # Recheck before every item, including after interrupted previous runs.
                 cards = await asyncio.to_thread(web.listings)
@@ -166,6 +168,12 @@ async def import_pending(config, store, directory, *, message_id=None):
                         store.mark(row, "submitted", matches[0])
                     else:
                         store.mark(row, "uncertain", error="Найдено несколько лекций с одинаковым заголовком.")
+                    continue
+                problem = telegram.download_problem(tg, row)
+                if problem:
+                    blocked += 1
+                    store.mark(row, "pending", error=problem)
+                    print(f"Сообщение {row['message_id']}: {problem}")
                     continue
                 # Validate auth and host allowlist before downloading a large file.
                 upload = await asyncio.to_thread(web.presign, row)
@@ -186,6 +194,8 @@ async def import_pending(config, store, directory, *, message_id=None):
                 print(f"Импортировано сообщение {row['message_id']}; lecture_id={matches[0]}")
         if message_id is None:
             await publish_submitted(config, store, web)
+        if blocked:
+            raise SyncError(f"Не скачано записей из-за лимита Bot API: {blocked}. Они сохранены в очереди; см. preview.")
     finally:
         web.close()
 
@@ -221,8 +231,7 @@ async def import_one(args, config, store, directory):
 
 async def async_command(args, config, store, directory):
     if args.command == "login-telegram":
-        await telegram.login()
-        print("Telegram-сессия сохранена в системной связке ключей.")
+        await telegram.login(config)
         return
     if args.command == "import-one":
         await import_one(args, config, store, directory)
@@ -234,46 +243,45 @@ async def async_command(args, config, store, directory):
         if args.command == "sync":
             # Previously uploaded lectures can be published even when Telegram
             # is temporarily unavailable or has no new messages.
+            auth_error = None
             try:
                 await publish_submitted(config, store)
-            except AuthExpired:
-                raise
+            except AuthExpired as exc:
+                # Bot API updates expire; save them even while web login needs renewal.
+                auth_error = exc
             except SyncError as exc:
                 # A deleted/unrecognised old lecture must not block new imports.
                 print(f"Проверка публикаций: {exc}")
-            async with telegram.connected() as tg:
+            async with telegram.connected(config) as tg:
                 await telegram.scan(tg, config, store)
+            if auth_error:
+                raise auth_error
         await import_pending(config, store, directory)
         return
-    async with telegram.connected() as tg:
-        if args.command == "dialogs":
-            async for dialog in tg.iter_dialogs():
-                if getattr(dialog.entity, "forum", False):
-                    output(dict(id=dialog.id, name=dialog.name))
+    async with telegram.connected(config) as tg:
+        tg.store = store
+        if args.command in ("dialogs", "topics", "scan"):
+            await telegram.scan(tg, config, store, history=getattr(args, "history", False))
+            if args.command == "dialogs":
+                for row in store.db.execute("SELECT chat_id,name FROM bot_chats WHERE bot_id=?", (tg.bot_id,)):
+                    output(dict(row))
+            elif args.command == "topics":
+                for row in store.db.execute("SELECT topic_id,name FROM bot_topics WHERE bot_id=? AND chat_id=?",
+                                             (tg.bot_id, config["chat_id"])):
+                    output(dict(row))
             return
         if args.command == "configure":
-            if args.chat_id:
+            if args.chat_id is not None:
                 config["chat_id"] = args.chat_id
+            if args.topic_ids is not None:
+                config["topic_ids"] = args.topic_ids
+            if (not config["topic_ids"] or len(config["topic_ids"]) != len(config["topic_names"])
+                    or any(t <= 0 for t in config["topic_ids"])
+                    or len(set(config["topic_ids"])) != len(config["topic_ids"])):
+                raise SyncError("Передайте --topic-ids: уникальные положительные ID в порядке topic_names.")
             dialog = await telegram.resolve_chat(tg, config)
-            all_topics = await telegram.topics(tg, dialog.entity)
-            selected = []
-            for name in config["topic_names"]:
-                matches = [t for t in all_topics if t.title.casefold() == name.casefold()]
-                if len(matches) != 1:
-                    for t in all_topics:
-                        output(dict(id=t.id, title=t.title))
-                    raise SyncError("Название темы не найдено однозначно. Уточните topic_names в конфигурации.")
-                selected.append(matches[0].id)
-            config["chat_id"] = dialog.id
-            config["topic_ids"] = selected
             save_config(args.config, config)
-            output(dict(chat_id=dialog.id, topics=dict(zip(selected, config["topic_names"])) ))
-        elif args.command == "topics":
-            dialog = await telegram.resolve_chat(tg, config)
-            for topic in await telegram.topics(tg, dialog.entity):
-                output(dict(id=topic.id, title=topic.title))
-        elif args.command == "scan":
-            await telegram.scan(tg, config, store, history=args.history)
+            output(dict(chat_id=dialog.id, topics=dict(zip(config["topic_ids"], config["topic_names"]))))
 
 
 def parser():
@@ -284,8 +292,9 @@ def parser():
         sub.add_parser(command)
     c = sub.add_parser("configure")
     c.add_argument("--chat-id", type=int)
+    c.add_argument("--topic-ids", type=int, nargs="+", help="ID топиков в порядке topic_names")
     s = sub.add_parser("scan")
-    s.add_argument("--history", action="store_true", help="Заново просмотреть историю с даты since")
+    s.add_argument("--history", action="store_true", help="Не поддерживается Bot API; команда объяснит ограничение")
     one = sub.add_parser("import-one", help="Загрузить одну запись Telegram, дождаться обработки и опубликовать")
     one.add_argument("message", help="ID сообщения или приватная ссылка t.me/c/…")
     one.add_argument("--timeout", type=int, default=7200, help="Ожидание обработки в секундах (по умолчанию 7200)")

@@ -130,7 +130,7 @@ class PublicationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_old_publication_failure_does_not_block_new_imports(self):
         @contextlib.asynccontextmanager
-        async def connected():
+        async def connected(*args):
             yield object()
         with patch.object(cli, "publish_submitted", AsyncMock(side_effect=SyncError("Старая лекция удалена"))), \
              patch.object(cli.telegram, "connected", connected), \

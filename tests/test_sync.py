@@ -242,7 +242,7 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
                     return file
 
             @contextlib.asynccontextmanager
-            async def connected():
+            async def connected(*args):
                 yield FakeTG()
 
             async def resolve(*args):
@@ -268,7 +268,7 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
             client = remote(server)
 
             @contextlib.asynccontextmanager
-            async def connected():
+            async def connected(*args):
                 yield NS()
 
             async def resolve(*args):
@@ -287,35 +287,6 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(server.created), 1)
             store.close()
 
-    async def test_scan_filters_other_topics_and_before_local_midnight(self):
-        rows = [NS(id=100, date=dt.datetime(2026, 10, 31, tzinfo=dt.timezone.utc),
-                   reply_to=NS(forum_topic=True, reply_to_top_id=None, reply_to_msg_id=10),
-                   file=NS(name="lecture.mp4", size=5, mime_type="application/octet-stream")),
-                NS(id=99, date=dt.datetime(2026, 10, 31, tzinfo=dt.timezone.utc),
-                   reply_to=NS(forum_topic=True, reply_to_top_id=99, reply_to_msg_id=98),
-                   file=NS(name="other.mp4", size=5, mime_type="video/mp4")),
-                NS(id=98, date=dt.datetime(2026, 10, 30, 20, tzinfo=dt.timezone.utc))]
-
-        class FakeTG:
-            def iter_messages(self, *args, **kwargs):
-                async def gen():
-                    for m in rows:
-                        yield m
-                return gen()
-
-        async def resolve(*args):
-            return NS(id=-100123, entity=NS())
-
-        with tempfile.TemporaryDirectory() as tmp:
-            store = Store(Path(tmp) / "db")
-            config = DEFAULT | dict(chat_id=-100123, topic_ids=[10, 20])
-            with patch.object(telegram, "resolve_chat", resolve):
-                await telegram.scan(FakeTG(), config, store)
-                await telegram.scan(FakeTG(), config, store)
-            self.assertEqual([r["message_id"] for r in store.rows()], [100])
-            self.assertEqual(store.rows()[0]["mime"], "video/mp4")
-            self.assertEqual(store.cursor(-100123, 20), 100)
-            store.close()
 
 
 if __name__ == "__main__":

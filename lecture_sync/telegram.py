@@ -1,17 +1,248 @@
 from __future__ import annotations
 
+import asyncio
+import datetime as dt
 import getpass
-import inspect
+import json
 import mimetypes
+import re
 import shutil
 from contextlib import asynccontextmanager
-from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from pathlib import Path, PurePosixPath
+from types import SimpleNamespace as NS
+from urllib.parse import parse_qs, quote, urlsplit
+
+import requests
 
 from . import secrets
 from .core import SyncError, cutoff, lecture_title, topic_of
 
+CLOUD_LIMIT = 20 * 1024 * 1024
 EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"}
+
+
+class BotClient:
+    def __init__(self, token, config):
+        if not re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]+", token):
+            raise SyncError("Некорректный токен BotFather.")
+        self.token, self.config = token, config
+        self.base = config["telegram_api_url"]
+        self.local = self.base != "https://api.telegram.org"
+        self.bot_id = int(token.split(":", 1)[0])
+        self.session = requests.Session()
+        self.session.trust_env = False
+        self.store = None
+
+    def close(self):
+        self.session.close()
+
+    def call(self, method, **params):
+        response = None
+        try:
+            response = self.session.post(f"{self.base}/bot{self.token}/{method}",
+                                         json=params, timeout=(15, 60), allow_redirects=False)
+            data = response.json()
+            if response.status_code != 200 or not data.get("ok"):
+                code = data.get("error_code", response.status_code)
+                if code == 409:
+                    raise SyncError("Bot API: конфликт getUpdates. Отключите webhook или другой получатель обновлений этого бота.")
+                if code == 429:
+                    raise SyncError("Bot API: слишком много запросов; повторите позднее.")
+                raise SyncError(f"Bot API: {method} отклонён (HTTP/API {code}).")
+            return data["result"]
+        except (requests.RequestException, ValueError, KeyError, TypeError):
+            raise SyncError(f"Bot API: не удалось выполнить {method}; детали с токеном скрыты.") from None
+        finally:
+            if response is not None:
+                response.close()
+
+    async def get_messages(self, entity, ids):
+        row = self.store.db.execute(
+            "SELECT metadata FROM bot_files WHERE bot_id=? AND chat_id=? AND message_id=?",
+            (self.bot_id, entity, ids)).fetchone()
+        if not row:
+            raise SyncError("Бот ещё не получил этот файл. Выполните scan после новой отправки записи в выбранный топик; Bot API не читает историю.")
+        return cached_message(json.loads(row[0]))
+
+    def fetch_file(self, message, target):
+        info = self.call("getFile", file_id=message.file.file_id)
+        value = info.get("file_path", "")
+        target = Path(target)
+        if self.local:
+            root = self.config.get("telegram_local_files", "")
+            if not root:
+                raise SyncError("Для локального Bot API задайте telegram_local_files: корень его файлов на этом компьютере.")
+            source = Path(value).resolve()
+            if (not Path(value).is_absolute() or not source.is_relative_to(Path(root).resolve())
+                    or not source.is_file() or source.stat().st_size != message.file.size):
+                raise SyncError("Bot API вернул недоступный файл вне разрешённого каталога или неверного размера.")
+            shutil.copyfile(source, target)
+            return str(target)
+        parts = PurePosixPath(value)
+        if not value or parts.is_absolute() or ".." in parts.parts or "\\" in value:
+            raise SyncError("Bot API вернул некорректный путь файла.")
+        try:
+            with self.session.get(f"{self.base}/file/bot{self.token}/{quote(value, safe='/')}",
+                                  stream=True, timeout=(15, 120), allow_redirects=False) as response:
+                if response.status_code != 200:
+                    raise SyncError("Bot API: не удалось скачать файл.")
+                size = 0
+                with target.open("wb") as stream:
+                    for chunk in response.iter_content(1024 * 1024):
+                        size += len(chunk)
+                        if size > message.file.size:
+                            raise SyncError("Bot API передал больше данных, чем заявлено.")
+                        stream.write(chunk)
+        except requests.RequestException:
+            raise SyncError("Загрузка из Bot API прервана; детали с токеном скрыты.") from None
+        return str(target)
+
+    async def download_media(self, message, file):
+        return await asyncio.to_thread(self.fetch_file, message, file)
+
+
+def cached_message(data):
+    return NS(id=data["message_id"], date=dt.datetime.fromtimestamp(data["date"], dt.timezone.utc),
+              reply_to=NS(forum_topic=True, reply_to_top_id=data["topic_id"], reply_to_msg_id=data["topic_id"]),
+              file=NS(**data["file"]))
+
+
+async def login(config):
+    token = getpass.getpass("Токен Telegram-бота из BotFather: ").strip()
+    client = BotClient(token, config)
+    try:
+        me = await asyncio.to_thread(client.call, "getMe")
+        if not me.get("is_bot") or me.get("id") != client.bot_id:
+            raise SyncError("Bot API не подтвердил аккаунт бота.")
+        secrets.update(telegram_bot=dict(token=token))
+        print(f"Бот @{me.get('username', '')}; токен сохранён в системной связке ключей.")
+    finally:
+        client.close()
+
+
+@asynccontextmanager
+async def connected(config):
+    token = secrets.read().get("telegram_bot", {}).get("token")
+    if not token:
+        raise SyncError("Сначала выполните login-telegram и введите токен BotFather.")
+    client = BotClient(token, config)
+    try:
+        yield client
+    finally:
+        client.close()
+
+
+async def resolve_chat(client, config):
+    if not config["chat_id"]:
+        raise SyncError("Выполните configure --chat-id … --topic-ids … .")
+    chat = await asyncio.to_thread(client.call, "getChat", chat_id=config["chat_id"])
+    if chat.get("id") != config["chat_id"] or not chat.get("is_forum"):
+        raise SyncError("Выбранный чат не является доступной боту группой с топиками.")
+    return NS(id=chat["id"], entity=chat["id"])
+
+
+def ingest(client, config, store, update):
+    # Persist only group/topic identifiers and file metadata, never message text,
+    # captions, user profiles or private conversations. Never trust forwarded origin.
+    m = update.get("message")
+    if not m:
+        return
+    chat = m.get("chat", {})
+    if not chat.get("is_forum") or chat.get("type") != "supergroup":
+        return
+    db = store.db
+    db.execute("INSERT OR REPLACE INTO bot_chats VALUES (?,?,?)",
+               (client.bot_id, chat["id"], chat.get("title", "")))
+    topic = m.get("message_thread_id", 1)
+    title = (m.get("forum_topic_created") or m.get("forum_topic_edited") or {}).get("name", "")
+    db.execute("INSERT INTO bot_topics VALUES (?,?,?,?) ON CONFLICT(bot_id,chat_id,topic_id) "
+               "DO UPDATE SET name=CASE WHEN excluded.name!='' THEN excluded.name ELSE name END",
+               (client.bot_id, chat["id"], topic, title))
+    selected = (chat["id"] == config["chat_id"] if config["chat_id"] else chat.get("title") == config["chat_name"])
+    if not selected or (config["topic_ids"] and topic not in config["topic_ids"]):
+        return
+    media = m.get("document") or m.get("video") or m.get("audio") or m.get("voice")
+    if not media:
+        return
+    mime = media.get("mime_type", "")
+    filename = media.get("file_name") or f"recording-{m['message_id']}{mimetypes.guess_extension(mime) or ''}"
+    filename = Path(filename.replace("\\", "/")).name
+    if Path(filename).suffix.lower() not in EXTENSIONS:
+        return
+    data = dict(message_id=m["message_id"], date=m["date"], topic_id=topic,
+                file=dict(file_id=media["file_id"], name=filename,
+                          size=media.get("file_size", 0), mime_type=mime))
+    # First-seen immutable metadata prevents edited files from replacing an upload.
+    db.execute("INSERT OR IGNORE INTO bot_files VALUES (?,?,?,?)",
+               (client.bot_id, chat["id"], m["message_id"], json.dumps(data)))
+
+
+def queue_cached(client, config, store):
+    if not config["chat_id"] or not config["topic_ids"]:
+        return
+    for row in store.db.execute("SELECT metadata FROM bot_files WHERE bot_id=? AND chat_id=?",
+                                (client.bot_id, config["chat_id"])).fetchall():
+        message = cached_message(json.loads(row[0]))
+        if message.date < cutoff(config):
+            continue
+        try:
+            store.add(**recording_data(message, config["chat_id"], config))
+        except SyncError:
+            continue
+
+
+async def scan(client, config, store, history=False):
+    if history:
+        raise SyncError("Bot API не читает историю. scan получает только ещё доступные обновления (Telegram хранит их до 24 часов).")
+    client.store = store
+    webhook = await asyncio.to_thread(client.call, "getWebhookInfo")
+    if webhook.get("url"):
+        raise SyncError("У бота установлен webhook. Используйте отдельного бота без webhook для LectureBot.")
+    row = store.db.execute("SELECT next_id FROM bot_offsets WHERE bot_id=?", (client.bot_id,)).fetchone()
+    offset = row[0] if row else 0
+    # A bounded drain lets uploads/publication run even in busy groups.
+    for _ in range(20):
+        updates = await asyncio.to_thread(client.call, "getUpdates", offset=offset, limit=100,
+                                         timeout=1, allowed_updates=["message"])
+        if not updates:
+            break
+        next_id = max(u["update_id"] for u in updates) + 1
+        try:
+            with store.db:
+                for update in updates:
+                    ingest(client, config, store, update)
+                store.db.execute("INSERT OR REPLACE INTO bot_offsets VALUES (?,?)", (client.bot_id, next_id))
+        except Exception:
+            # Next getUpdates acknowledges only the batch committed above.
+            raise
+        offset = next_id
+        if len(updates) < 100:
+            break
+    queue_cached(client, config, store)
+
+
+async def queue_one(value, config, store):
+    message_id, hint = message_selection(value, config)
+    existing = next((r for r in store.rows(chat_id=config["chat_id"]) if r["message_id"] == message_id), None)
+    if existing:
+        if existing["topic_id"] not in config["topic_ids"] or hint not in (None, existing["topic_id"]):
+            raise SyncError("Запись не соответствует выбранному топику.")
+        return message_id
+    async with connected(config) as client:
+        await scan(client, config, store)
+        dialog = await resolve_chat(client, config)
+        message = await client.get_messages(dialog.entity, ids=message_id)
+        row = recording_data(message, dialog.id, config)
+        if hint not in (None, row["topic_id"]):
+            raise SyncError("Топик сообщения не совпадает с топиком ссылки.")
+        store.add(**row)
+    return message_id
+
+
+def download_problem(client, row):
+    if not getattr(client, "local", False) and row["size"] > CLOUD_LIMIT:
+        return "Файл больше 20 МБ: облачный Bot API его не скачает. Нужен локальный Bot API сервер."
+    return None
 
 
 def message_selection(value: str, config):
@@ -66,121 +297,6 @@ def recording_data(message, chat_id, config):
     return dict(chat_id=chat_id, message_id=message.id, topic_id=topic, subject=subjects[topic],
                 filename=filename, size=file.size, mime=mime, published_at=message.date.isoformat(),
                 title=lecture_title(subjects[topic], message.date.astimezone(cutoff(config).tzinfo), filename, chat_id, message.id))
-
-
-async def queue_one(value, config, store):
-    message_id, hint = message_selection(value, config)
-    existing = next((r for r in store.rows(chat_id=config["chat_id"]) if r["message_id"] == message_id), None)
-    if existing:
-        if existing["topic_id"] not in config["topic_ids"] or hint not in (None, existing["topic_id"]):
-            raise SyncError("Запись не соответствует выбранному топику.")
-        return message_id
-    async with connected() as client:
-        dialog = await resolve_chat(client, config)
-        message = await client.get_messages(dialog.entity, ids=message_id)
-        row = recording_data(message, dialog.id, config)
-        if hint not in (None, row["topic_id"]):
-            raise SyncError("Топик сообщения не совпадает с топиком ссылки.")
-        # Manual selection is explicit and may precede the automatic cutoff.
-        # Do not advance cursors: this must not skip any other messages.
-        store.add(**row)
-    return message_id
-
-
-async def login():
-    from telethon import TelegramClient
-    from telethon.sessions import StringSession
-
-    api_id = int(input("Telegram api_id (my.telegram.org/apps): ").strip())
-    api_hash = getpass.getpass("Telegram api_hash: ").strip()
-    client = TelegramClient(StringSession(), api_id, api_hash, receive_updates=False)
-    try:
-        await client.start(phone=lambda: input("Номер вашего основного Telegram-аккаунта: "),
-                           code_callback=lambda: getpass.getpass("Код входа Telegram: "),
-                           password=lambda: getpass.getpass("Пароль 2FA Telegram: "))
-        secrets.update(telegram=dict(api_id=api_id, api_hash=api_hash, session=client.session.save()))
-    finally:
-        await client.disconnect()
-
-
-@asynccontextmanager
-async def connected():
-    from telethon import TelegramClient
-    from telethon.sessions import StringSession
-
-    data = secrets.read().get("telegram")
-    if not data:
-        raise SyncError("Сначала выполните login-telegram.")
-    client = TelegramClient(StringSession(data["session"]), data["api_id"], data["api_hash"], receive_updates=False)
-    try:
-        await client.connect()
-        if not await client.is_user_authorized():
-            raise SyncError("Telegram-сессия отозвана. Повторите login-telegram.")
-        yield client
-    finally:
-        await client.disconnect()
-
-
-async def resolve_chat(client, config):
-    # Enumerating dialogs populates access_hash without storing other chats on disk.
-    matches = []
-    async for dialog in client.iter_dialogs():
-        if (config["chat_id"] and dialog.id == config["chat_id"]) or (not config["chat_id"] and dialog.name == config["chat_name"]):
-            matches.append(dialog)
-    if len(matches) != 1:
-        raise SyncError("Не удалось однозначно выбрать группу. Выполните dialogs и задайте chat_id.")
-    if not getattr(matches[0].entity, "forum", False):
-        raise SyncError("Выбранный чат не является группой с топиками.")
-    return matches[0]
-
-
-async def topics(client, entity):
-    from telethon import functions
-    request = getattr(functions.messages, "GetForumTopicsRequest", None) or getattr(functions.channels, "GetForumTopicsRequest", None)
-    if request is None:
-        raise SyncError("Эта версия Telethon не поддерживает получение топиков.")
-    field = "peer" if "peer" in inspect.signature(request).parameters else "channel"
-    offset_date, offset_id, offset_topic = None, 0, 0
-    result, seen = [], set()
-    while True:
-        page = await client(request(**{field: entity}, offset_date=offset_date, offset_id=offset_id, offset_topic=offset_topic, limit=100))
-        new = [t for t in page.topics if hasattr(t, "title") and t.id not in seen]
-        if not new:
-            break
-        result.extend(new)
-        seen.update(t.id for t in new)
-        last = new[-1]
-        offset_topic, offset_id = last.id, last.top_message
-        # offset_date is the date of the last topic's last message.
-        msg = next((m for m in page.messages if m.id == last.top_message), None)
-        offset_date = last.date if getattr(page, "order_by_create_date", False) else (msg.date if msg else last.date)
-        if len(seen) >= page.count:
-            break
-    return result
-
-
-async def scan(client, config, store, history=False):
-    dialog = await resolve_chat(client, config)
-    if not config["topic_ids"] or len(config["topic_ids"]) != len(config["topic_names"]):
-        raise SyncError("Сначала выполните configure для сохранения ID выбранных топиков.")
-    subjects = dict(zip(config["topic_ids"], config["topic_names"], strict=True))
-    cursors = {topic: 0 if history else store.cursor(dialog.id, topic) for topic in subjects}
-    high = max(cursors.values(), default=0)
-    since = cutoff(config)
-    async for message in client.iter_messages(dialog.entity, min_id=min(cursors.values()), reverse=False):
-        high = max(high, message.id)
-        if message.date < since:
-            break
-        topic = topic_of(message)
-        if topic not in subjects or message.id <= cursors[topic]:
-            continue
-        try:
-            store.add(**recording_data(message, dialog.id, config))
-        except SyncError:
-            continue
-    # Only commit high-water marks after an entire successful scan.
-    for topic in subjects:
-        store.advance(dialog.id, topic, high)
 
 
 def download_path(row, directory: Path):
