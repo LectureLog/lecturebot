@@ -14,11 +14,13 @@
 
 ## Установка на Ubuntu 24.04 Desktop
 
-Скопируйте проект в `~/Projects/LectureBot`:
+Склонируйте проект в `~/Projects/LectureBot`:
 
 ```sh
 sudo apt update
 sudo apt install python3-venv gnome-keyring libsecret-1-0
+mkdir -p ~/Projects
+git clone https://github.com/LectureLog/lecturebot.git ~/Projects/LectureBot
 cd ~/Projects/LectureBot
 python3 -m venv .venv
 .venv/bin/python -m pip install -e '.[browser]'
